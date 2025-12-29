@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# But include .gitignore itself
+!.gitignore
+
+# And include _bmad-output
+!_bmad-output/
+
