@@ -16,6 +16,7 @@ from src.bottleneck_analyzer import BottleneckAnalyzer
 from src.visual_timeline import TimelineVisualizer
 from src.audit_export import generate_quick_audit_report
 import src.config as config
+from src.config import ProgramConfiguration
 
 # Page configuration
 st.set_page_config(
@@ -70,6 +71,8 @@ if 'messages' not in st.session_state:
     st.session_state.messages = []
 if 'bottleneck_summary' not in st.session_state:
     st.session_state.bottleneck_summary = None
+if 'program_config' not in st.session_state:
+    st.session_state.program_config = ProgramConfiguration()
 
 # Helper Functions
 def parse_uploaded_file(uploaded_file, current_date):
@@ -91,46 +94,77 @@ def parse_uploaded_file(uploaded_file, current_date):
         return None, str(e)
 
 def interns_to_dataframe(interns):
-    """Convert list of Intern objects to DataFrame for display/editing."""
+    """
+    Convert list of Intern objects to DataFrame for display/editing.
+    Each intern has their own individual timeline based on their start_date.
+    """
     if not interns:
         return pd.DataFrame()
     
-    # Find max months
-    max_months = max(intern.total_months for intern in interns)
+    # Find the date range across ALL interns
+    all_dates = set()
+    for intern in interns:
+        for month_idx in intern.assignments.keys():
+            date = intern.get_month_date(month_idx)
+            all_dates.add((date.year, date.month))
     
-    # Build DataFrame
+    if not all_dates:
+        return pd.DataFrame()
+    
+    # Create sorted list of dates
+    sorted_dates = sorted(all_dates)
+    date_strings = [f"{year}-{month:02d}" for year, month in sorted_dates]
+    
+    # Build DataFrame with individual timelines
     data = {}
-    data['Month'] = [(interns[0].start_date + timedelta(days=30*i)).strftime("%Y-%m") 
-                     for i in range(max_months)]
+    data['Month'] = date_strings
     
     for intern in interns:
         stations = config.STATIONS_MODEL_A if intern.model == 'A' else config.STATIONS_MODEL_B
         intern_schedule = []
         
-        for month_idx in range(max_months):
-            if month_idx in intern.assignments:
-                station_key = intern.assignments[month_idx]
-                station_name = stations.get(station_key, {'name': station_key})
-                if isinstance(station_name, dict):
-                    station_name = station_name.get('name', station_key)
-                else:
-                    station_name = station_name.name if hasattr(station_name, 'name') else str(station_name)
-                intern_schedule.append(station_name)
-            else:
+        # For each date in the global timeline
+        for year, month in sorted_dates:
+            current_date = datetime(year, month, 1)
+            
+            # Calculate what month_idx this corresponds to for THIS intern
+            if current_date < intern.start_date:
+                # This date is before intern started
                 intern_schedule.append("")
+            else:
+                # Calculate month_idx relative to intern's start_date
+                month_diff = (current_date.year - intern.start_date.year) * 12 + (current_date.month - intern.start_date.month)
+                
+                if month_diff in intern.assignments:
+                    station_key = intern.assignments[month_diff]
+                    station_obj = stations.get(station_key)
+                    if station_obj:
+                        station_name = station_obj.name if hasattr(station_obj, 'name') else str(station_key)
+                    else:
+                        station_name = str(station_key)
+                    intern_schedule.append(station_name)
+                else:
+                    # This date is in intern's timeline but no assignment
+                    intern_schedule.append("")
         
         data[intern.name] = intern_schedule
     
     return pd.DataFrame(data)
 
 def create_gantt_chart(interns):
-    """Create interactive Gantt chart for God View."""
+    """
+    Create interactive Gantt chart for God View.
+    Sorted by start_date: newest interns (latest start_date) at top, oldest at bottom.
+    """
     if not interns:
         return go.Figure()
     
+    # Sort interns by start_date descending (newest first)
+    sorted_interns = sorted(interns, key=lambda x: x.start_date, reverse=True)
+    
     df_data = []
     
-    for intern in interns:
+    for intern in sorted_interns:
         stations = config.STATIONS_MODEL_A if intern.model == 'A' else config.STATIONS_MODEL_B
         
         # Group consecutive months with same station
@@ -157,7 +191,8 @@ def create_gantt_chart(interns):
                         'Station': station_name,
                         'Start': start_date,
                         'End': end_date,
-                        'Department': intern.department
+                        'Department': intern.department,
+                        'StartDate': intern.start_date  # For sorting reference
                     })
                 
                 # Start new block
@@ -177,7 +212,8 @@ def create_gantt_chart(interns):
                 'Station': station_name,
                 'Start': start_date,
                 'End': end_date,
-                'Department': intern.department
+                'Department': intern.department,
+                'StartDate': intern.start_date  # For sorting reference
             })
     
     if not df_data:
@@ -190,10 +226,14 @@ def create_gantt_chart(interns):
     
     df = pd.DataFrame(df_data)
     
-    fig = px.timeline(df, x_start="Start", x_end="End", y="Intern", color="Station",
-                      title="God View Matrix - 72-Month Timeline")
+    # Create custom category order (newest to oldest)
+    intern_order = [intern.name for intern in sorted_interns]
     
-    fig.update_yaxes(categoryorder="total ascending")
+    fig = px.timeline(df, x_start="Start", x_end="End", y="Intern", color="Station",
+                      title="God View Matrix - Individual Timelines (Newest → Oldest)")
+    
+    # Set custom y-axis category order (maintains sort by start_date descending)
+    fig.update_yaxes(categoryorder="array", categoryarray=intern_order)
     fig.update_layout(
         height=max(400, len(interns) * 40),
         xaxis_title="Timeline",
@@ -273,6 +313,7 @@ def run_scheduler(interns, current_date, time_limit):
 def sync_editor_changes(edited_df):
     """
     Sync changes from data editor back to Intern objects in session state.
+    Now handles individual intern timelines based on their start_date.
     Returns (success, message, updated_count).
     """
     try:
@@ -289,6 +330,18 @@ def sync_editor_changes(edited_df):
         for station_key, station in config.STATIONS_MODEL_B.items():
             station_name_to_key_b[station.name.strip().lower()] = station_key
         
+        # Parse dates from Month column
+        if 'Month' not in edited_df.columns:
+            return False, "Month column missing from edited data", 0
+        
+        dates = []
+        for date_str in edited_df['Month']:
+            try:
+                year, month = date_str.split('-')
+                dates.append(datetime(int(year), int(month), 1))
+            except:
+                dates.append(None)
+        
         # Iterate through each intern in session state
         for intern in st.session_state.interns:
             if intern.name not in edited_df.columns:
@@ -298,14 +351,24 @@ def sync_editor_changes(edited_df):
             station_mapping = station_name_to_key_a if intern.model == 'A' else station_name_to_key_b
             stations_config = config.STATIONS_MODEL_A if intern.model == 'A' else config.STATIONS_MODEL_B
             
-            # Update assignments for each month
+            # Update assignments for each date in the DataFrame
             changes_made = False
-            for month_idx, station_name in enumerate(edited_df[intern.name]):
+            for row_idx, (current_date, station_name) in enumerate(zip(dates, edited_df[intern.name])):
+                if current_date is None:
+                    continue
+                
+                # Calculate month_idx relative to THIS intern's start_date
+                if current_date < intern.start_date:
+                    # This date is before intern started - skip
+                    continue
+                
+                month_diff = (current_date.year - intern.start_date.year) * 12 + (current_date.month - intern.start_date.month)
+                
                 # Skip empty cells
                 if pd.isna(station_name) or not str(station_name).strip():
                     # Remove assignment if it exists
-                    if month_idx in intern.assignments:
-                        del intern.assignments[month_idx]
+                    if month_diff in intern.assignments:
+                        del intern.assignments[month_diff]
                         changes_made = True
                     continue
                 
@@ -327,13 +390,15 @@ def sync_editor_changes(edited_df):
                 
                 if station_key:
                     # Check if this is a change
-                    if month_idx not in intern.assignments or intern.assignments[month_idx] != station_key:
-                        intern.assignments[month_idx] = station_key
+                    if month_diff not in intern.assignments or intern.assignments[month_diff] != station_key:
+                        intern.assignments[month_diff] = station_key
                         changes_made = True
                 else:
-                    errors.append(f"{intern.name}, Month {month_idx}: Unknown station '{station_name}'")
+                    errors.append(f"{intern.name}, {current_date.strftime('%Y-%m')}: Unknown station '{station_name}'")
             
             if changes_made:
+                # Recalculate leave counts after changes
+                intern.calculate_leave_counts()
                 updated_count += 1
         
         if errors:
@@ -347,6 +412,10 @@ def sync_editor_changes(edited_df):
     except Exception as e:
         import traceback
         return False, f"Error syncing changes: {str(e)}\n{traceback.format_exc()}", 0
+
+def send_email(intern):
+    """Mock email sending function for demo."""
+    return f"📧 Schedule sent to {intern.email if intern.email else intern.name + '@example.com'}"
 
 def get_ai_response(user_input, context):
     """Mock AI response function for hackathon demo."""
@@ -607,6 +676,24 @@ with st.sidebar:
         col1, col2 = st.columns(2)
         col1.metric("Model A", model_a)
         col2.metric("Model B", model_b)
+        
+        # Quick validation status
+        try:
+            validator = ScheduleValidator(st.session_state.interns, use_ai=False, program_config=st.session_state.program_config)
+            quick_val = validator.validate(current_date=st.session_state.current_date)
+            
+            st.divider()
+            st.caption("📋 Validation Status")
+            if quick_val.is_valid:
+                st.success("✅ All Valid", icon="✅")
+            else:
+                col_err, col_warn = st.columns(2)
+                with col_err:
+                    st.error(f"❌ {len(quick_val.errors)}", icon="❌")
+                with col_warn:
+                    st.warning(f"⚠️ {len(quick_val.warnings)}", icon="⚠️")
+        except:
+            pass
     
     # AI Advisory Chat
     st.divider()
@@ -686,7 +773,7 @@ if not st.session_state.interns:
     st.stop()
 
 # Create tabs
-tab1, tab2, tab3 = st.tabs(["📅 God View (Timeline)", "📝 Interactive Editor", "📊 Analytics & Bottlenecks"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📅 God View (Timeline)", "📝 Interactive Editor", "📊 Analytics & Bottlenecks", "👥 Manage Interns", "👤 Personal View", "⚙️ Rules Engine"])
 
 # ==================== TAB 1: GOD VIEW ====================
 with tab1:
@@ -757,14 +844,101 @@ with tab2:
                         # Show sync summary
                         st.success(message)
                         
+                        # Run comprehensive validation
+                        with st.spinner("🔍 Running validation checks..."):
+                            try:
+                                validator = ScheduleValidator(st.session_state.interns, use_ai=False, program_config=st.session_state.program_config)
+                                validation_result = validator.validate(current_date=st.session_state.current_date)
+                                
+                                # Display validation results
+                                st.divider()
+                                st.markdown("### 🔍 Validation Results")
+                                
+                                col_val1, col_val2, col_val3 = st.columns(3)
+                                with col_val1:
+                                    st.metric("Errors", len(validation_result.errors),
+                                             delta=f"-{len(validation_result.errors)}" if len(validation_result.errors) > 0 else None,
+                                             delta_color="inverse")
+                                with col_val2:
+                                    st.metric("Warnings", len(validation_result.warnings),
+                                             delta=f"-{len(validation_result.warnings)}" if len(validation_result.warnings) > 0 else None,
+                                             delta_color="inverse")
+                                with col_val3:
+                                    status_icon = "✅" if validation_result.is_valid else "❌"
+                                    st.metric("Status", f"{status_icon} {'Valid' if validation_result.is_valid else 'Invalid'}")
+                                
+                                # Show errors
+                                if validation_result.errors:
+                                    st.error("🔴 **Validation Errors** (Must be fixed)")
+                                    error_data = []
+                                    for error in validation_result.errors:
+                                        # Parse error message
+                                        if ':' in error:
+                                            parts = error.split(':', 1)
+                                            intern_name = parts[0].strip()
+                                            description = parts[1].strip() if len(parts) > 1 else error
+                                        else:
+                                            intern_name = "General"
+                                            description = error
+                                        
+                                        error_data.append({
+                                            "Intern": intern_name,
+                                            "Type": "Error",
+                                            "Description": description
+                                        })
+                                    
+                                    df_errors = pd.DataFrame(error_data)
+                                    st.dataframe(df_errors, use_container_width=True, height=min(300, len(error_data) * 35 + 38))
+                                
+                                # Show warnings
+                                if validation_result.warnings:
+                                    st.warning("🟡 **Validation Warnings** (Recommended to fix)")
+                                    warning_data = []
+                                    for warning in validation_result.warnings:
+                                        if ':' in warning:
+                                            parts = warning.split(':', 1)
+                                            intern_name = parts[0].strip()
+                                            description = parts[1].strip() if len(parts) > 1 else warning
+                                        else:
+                                            intern_name = "General"
+                                            description = warning
+                                        
+                                        warning_data.append({
+                                            "Intern": intern_name,
+                                            "Type": "Warning",
+                                            "Description": description
+                                        })
+                                    
+                                    df_warnings = pd.DataFrame(warning_data)
+                                    st.dataframe(df_warnings, use_container_width=True, height=min(200, len(warning_data) * 35 + 38))
+                                
+                                # Show success if valid
+                                if validation_result.is_valid:
+                                    st.success("✅ **All validation checks passed!** Schedule is compliant with all rules.")
+                                    st.balloons()
+                                else:
+                                    st.info("💡 **Note:** Changes are saved even with validation errors. You can override if needed.")
+                                
+                                # Toast notification
+                                if validation_result.is_valid:
+                                    st.toast("✅ Schedule validated - no issues!", icon="✅")
+                                else:
+                                    st.toast(f"⚠️ {len(validation_result.errors)} errors, {len(validation_result.warnings)} warnings", icon="⚠️")
+                                
+                            except Exception as e:
+                                st.error(f"Validation error: {str(e)}")
+                                st.toast("⚠️ Saved but validation failed", icon="⚠️")
+                        
                         # Re-run bottleneck analysis
-                        with st.spinner("🔍 Running bottleneck analysis..."):
+                        with st.spinner("📊 Running capacity analysis..."):
                             try:
                                 analyzer = BottleneckAnalyzer(st.session_state.interns, lookahead_months=12)
                                 analysis = analyzer.analyze()
                                 st.session_state.bottleneck_summary = analysis
                                 
-                                # Show detailed validation results
+                                st.divider()
+                                st.markdown("### 📊 Capacity Analysis")
+                                
                                 col_v1, col_v2, col_v3 = st.columns(3)
                                 with col_v1:
                                     st.metric("Bottlenecks", analysis['bottlenecks_found'])
@@ -773,33 +947,18 @@ with tab2:
                                              delta=f"-{analysis['critical_count']}" if analysis['critical_count'] > 0 else None,
                                              delta_color="inverse")
                                 with col_v3:
-                                    st.metric("Warnings", analysis['warning_count'],
+                                    st.metric("Capacity Warnings", analysis['warning_count'],
                                              delta=f"-{analysis['warning_count']}" if analysis['warning_count'] > 0 else None,
                                              delta_color="inverse")
                                 
-                                # Show status message
-                                if analysis['critical_count'] > 0:
-                                    st.warning(f"⚠️ {analysis['critical_count']} critical capacity issues detected. Review Tab 3 (Analytics) for details.")
-                                    st.toast(f"⚠️ {analysis['critical_count']} critical issues", icon="⚠️")
-                                elif analysis['warning_count'] > 0:
-                                    st.info(f"🟡 {analysis['warning_count']} warnings detected. Schedule is mostly valid.")
-                                    st.toast(f"🟡 {analysis['warning_count']} warnings", icon="🟡")
-                                else:
-                                    st.success("✅ No bottlenecks detected! Schedule looks great.")
-                                    st.toast("✅ Perfect schedule - no conflicts!", icon="✅")
-                                    st.balloons()
-                                
                             except Exception as e:
-                                st.error(f"Validation error: {str(e)}")
-                                st.toast("⚠️ Saved but validation failed", icon="⚠️")
+                                st.warning(f"Capacity analysis error: {str(e)}")
                         
-                        # Force rerun to refresh all visualizations
+                        # Save edited state
                         st.session_state.edited_df = edited_df.copy()
                         
-                        # Wait a moment before rerun
-                        import time
-                        time.sleep(0.5)
-                        st.rerun()
+                        # Keep validation results displayed
+                        st.info("💡 Changes saved! Switch to Tab 1 (God View) or Tab 3 (Analytics) to see updated visualizations.")
                     else:
                         st.error(message)
                         st.toast("❌ Sync failed - check error details above", icon="❌")
@@ -918,6 +1077,514 @@ with tab3:
             st.error(f"Error running bottleneck analysis: {str(e)}")
     else:
         st.warning("No intern data loaded")
+
+# ==================== TAB 4: MANAGE INTERNS ====================
+with tab4:
+    st.subheader("👥 Manage Interns")
+    
+    col_form, col_list = st.columns([1, 1])
+    
+    with col_form:
+        st.markdown("### ➕ Add New Intern")
+        
+        with st.form("add_intern_form", clear_on_submit=True):
+            new_name = st.text_input("Full Name", placeholder="Dr. Sarah Cohen")
+            new_email = st.text_input("Email", placeholder="sarah.cohen@hospital.org")
+            
+            col_model, col_dept = st.columns(2)
+            with col_model:
+                new_model = st.selectbox("Model", ["A", "B"], index=0)
+            with col_dept:
+                new_department = st.selectbox("Department", ["A", "B"], index=0)
+            
+            new_start_date = st.date_input("Start Date", value=datetime.now())
+            
+            auto_schedule = st.checkbox("Auto-generate schedule after adding", value=True,
+                                       help="Automatically run AI scheduler for this intern")
+            
+            submit_button = st.form_submit_button("➕ Add Intern", type="primary", use_container_width=True)
+            
+            if submit_button:
+                if not new_name.strip():
+                    st.error("❌ Name is required")
+                else:
+                    try:
+                        # Create new intern
+                        new_intern = Intern(
+                            name=new_name.strip(),
+                            start_date=datetime.combine(new_start_date, datetime.min.time()),
+                            model=new_model,
+                            department=new_department,
+                            current_month_index=0,
+                            email=new_email.strip(),
+                            total_months=72 if new_model == "A" else 66
+                        )
+                        
+                        # Add to session state
+                        st.session_state.interns.append(new_intern)
+                        
+                        st.success(f"✅ Added {new_name} successfully!")
+                        st.toast(f"✅ {new_name} added to program", icon="✅")
+                        
+                        # Auto-schedule if requested
+                        if auto_schedule:
+                            with st.spinner(f"Generating schedule for {new_name}..."):
+                                try:
+                                    current_date = st.session_state.current_date
+                                    start_month = min(intern.start_date for intern in st.session_state.interns)
+                                    
+                                    scheduler = SchedulerWithRelaxation(
+                                        interns=st.session_state.interns,
+                                        current_date=current_date,
+                                        start_month=start_month,
+                                        time_limit_seconds=120
+                                    )
+                                    
+                                    solution = scheduler.solve_with_relaxation()
+                                    
+                                    if solution.is_feasible:
+                                        st.success(f"✅ Schedule generated for {new_name}!")
+                                        st.toast(f"✅ {new_name}'s schedule ready", icon="✅")
+                                        st.balloons()
+                                    else:
+                                        st.warning(f"⚠️ Could not auto-schedule {new_name}. Run AI Scheduler manually.")
+                                except Exception as e:
+                                    st.warning(f"⚠️ Auto-scheduling failed: {str(e)}")
+                        
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"❌ Error adding intern: {str(e)}")
+    
+    with col_list:
+        st.markdown("### 📋 Current Interns")
+        
+        if st.session_state.interns:
+            # Create DataFrame for display
+            intern_data = []
+            for intern in st.session_state.interns:
+                # Use intelligent progress calculation
+                progress_data = intern.calculate_progress()
+                intern_data.append({
+                    "Name": intern.name,
+                    "Email": intern.email if intern.email else "—",
+                    "Model": intern.model,
+                    "Dept": intern.department,
+                    "Progress": f"{progress_data['percent']:.1f}%",
+                    "Assigned": f"{int(progress_data['completed'])}/{progress_data['total']}"
+                })
+            
+            df_interns = pd.DataFrame(intern_data)
+            st.dataframe(df_interns, use_container_width=True, height=400)
+            
+            # Delete intern section
+            st.divider()
+            st.markdown("### 🗑️ Remove Intern")
+            col_del1, col_del2 = st.columns([2, 1])
+            with col_del1:
+                intern_to_delete = st.selectbox(
+                    "Select intern to remove",
+                    options=[i.name for i in st.session_state.interns],
+                    key="delete_intern_select"
+                )
+            with col_del2:
+                if st.button("🗑️ Remove", type="secondary", use_container_width=True):
+                    st.session_state.interns = [i for i in st.session_state.interns if i.name != intern_to_delete]
+                    st.success(f"✅ Removed {intern_to_delete}")
+                    st.toast(f"🗑️ {intern_to_delete} removed", icon="🗑️")
+                    st.rerun()
+        else:
+            st.info("No interns in the system. Add one above!")
+
+# ==================== TAB 5: PERSONAL VIEW ====================
+with tab5:
+    st.subheader("👤 Personal View")
+    
+    if not st.session_state.interns:
+        st.info("No interns available. Upload data or add interns manually.")
+    else:
+        # Selector
+        selected_intern_name = st.selectbox(
+            "Select Intern",
+            options=[i.name for i in st.session_state.interns],
+            key="personal_view_select"
+        )
+        
+        # Find intern
+        selected_intern = next((i for i in st.session_state.interns if i.name == selected_intern_name), None)
+        
+        if selected_intern:
+            # Profile Card
+            st.markdown("---")
+            col_profile1, col_profile2, col_profile3 = st.columns([2, 1, 1])
+            
+            with col_profile1:
+                st.markdown(f"### {selected_intern.name}")
+                st.markdown(f"**Email:** {selected_intern.email if selected_intern.email else 'Not provided'}")
+                st.markdown(f"**Model:** {selected_intern.model} ({selected_intern.total_months} months)")
+                st.markdown(f"**Department:** {selected_intern.department}")
+                st.markdown(f"**Start Date:** {selected_intern.start_date.strftime('%B %d, %Y')}")
+            
+            with col_profile2:
+                # Calculate intelligent progress with leave logic
+                progress_data = selected_intern.calculate_progress()
+                completed = progress_data['completed']
+                total = progress_data['total']
+                progress_pct = progress_data['percent']
+                
+                st.metric("Effective Progress", f"{progress_pct:.1f}%", 
+                         f"{int(completed)}/{total} חודשים")
+            
+            with col_profile3:
+                if st.button("📧 Send Schedule to Email", type="primary", use_container_width=True):
+                    message = send_email(selected_intern)
+                    st.success(message)
+                    st.toast(message, icon="📧")
+            
+            # Custom impressive progress bar
+            st.markdown("#### 📊 התקדמות תכנית ההתמחות")
+            
+            # Determine color based on progress
+            if progress_pct < 33:
+                gradient_colors = "#FF6B6B, #FF8E53"  # Red to Orange
+            elif progress_pct < 66:
+                gradient_colors = "#FFA500, #FFD700"  # Orange to Gold
+            else:
+                gradient_colors = "#4CAF50, #8BC34A"  # Green to Light Green
+            
+            # Custom HTML progress bar
+            progress_html = f"""
+            <div style="margin-bottom: 1.5rem;">
+                <div style="background-color: #e0e0e0; border-radius: 12px; padding: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                    <div style="width: {progress_pct}%; background: linear-gradient(90deg, {gradient_colors}); height: 30px; border-radius: 8px; 
+                                text-align: center; color: white; line-height: 30px; font-weight: bold; font-size: 16px;
+                                transition: width 0.3s ease; box-shadow: inset 0 1px 2px rgba(255,255,255,0.3);">
+                        {progress_pct:.1f}%
+                    </div>
+                </div>
+                <div style="text-align: center; margin-top: 8px; color: #666; font-size: 14px;">
+                    <strong>הושלמו {int(completed)} מתוך {total} חודשים</strong>
+                    <span style="margin: 0 10px;">•</span>
+                    <span style="color: #999;">חל"ד (מוגבל ל-6): {min(selected_intern.maternity_leave_months, 6)}</span>
+                    <span style="margin: 0 10px;">•</span>
+                    <span style="color: #999;">מחלה (מוגבל ל-1/שנה): {sum(min(c, 1) for c in selected_intern.sick_leave_months_by_year.values())}</span>
+                    <span style="margin: 0 10px;">•</span>
+                    <span style="color: #c00;">חל"ת (לא נספר): {selected_intern.unpaid_leave_months}</span>
+                </div>
+            </div>
+            """
+            st.markdown(progress_html, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Personal Schedule
+            col_sched1, col_sched2 = st.columns([3, 2])
+            
+            with col_sched1:
+                st.markdown("### 📅 Personal Schedule")
+                
+                if selected_intern.assignments:
+                    stations = config.STATIONS_MODEL_A if selected_intern.model == 'A' else config.STATIONS_MODEL_B
+                    
+                    schedule_data = []
+                    for month_idx in sorted(selected_intern.assignments.keys()):
+                        station_key = selected_intern.assignments[month_idx]
+                        station = stations.get(station_key)
+                        station_name = station.name if station else station_key
+                        
+                        month_date = selected_intern.start_date + timedelta(days=30 * month_idx)
+                        status = "✓ Completed" if month_idx <= selected_intern.current_month_index else "Upcoming"
+                        
+                        schedule_data.append({
+                            "Month": month_date.strftime("%b %Y"),
+                            "Station": station_name,
+                            "Status": status
+                        })
+                    
+                    df_schedule = pd.DataFrame(schedule_data)
+                    st.dataframe(df_schedule, use_container_width=True, height=400)
+                else:
+                    st.info("No assignments yet. Run AI Scheduler to generate schedule.")
+            
+            with col_sched2:
+                st.markdown("### 📊 Station Breakdown")
+                
+                if selected_intern.assignments:
+                    # Count months per station
+                    station_counts = {}
+                    stations = config.STATIONS_MODEL_A if selected_intern.model == 'A' else config.STATIONS_MODEL_B
+                    
+                    for month_idx, station_key in selected_intern.assignments.items():
+                        station = stations.get(station_key)
+                        station_name = station.name if station else station_key
+                        station_counts[station_name] = station_counts.get(station_name, 0) + 1
+                    
+                    # Create chart
+                    chart_data = pd.DataFrame({
+                        "Station": list(station_counts.keys()),
+                        "Months": list(station_counts.values())
+                    })
+                    
+                    st.bar_chart(chart_data.set_index("Station"))
+                    
+                    # Table
+                    st.dataframe(chart_data, use_container_width=True)
+                else:
+                    st.info("No data to display")
+            
+            # Personal Timeline (Gantt for single intern)
+            st.markdown("---")
+            st.markdown("### 🗓️ Personal Timeline")
+            
+            if selected_intern.assignments:
+                # Create single-intern Gantt
+                df_data = []
+                stations = config.STATIONS_MODEL_A if selected_intern.model == 'A' else config.STATIONS_MODEL_B
+                
+                current_station = None
+                start_month = None
+                
+                for month_idx in sorted(selected_intern.assignments.keys()):
+                    station_key = selected_intern.assignments[month_idx]
+                    
+                    if station_key != current_station:
+                        if current_station is not None:
+                            station_obj = stations.get(current_station)
+                            station_name = station_obj.name if station_obj else current_station
+                            
+                            start_date = selected_intern.start_date + timedelta(days=30 * start_month)
+                            end_date = selected_intern.start_date + timedelta(days=30 * month_idx)
+                            
+                            df_data.append({
+                                'Station': station_name,
+                                'Start': start_date,
+                                'End': end_date
+                            })
+                        
+                        current_station = station_key
+                        start_month = month_idx
+                
+                # Add final block
+                if current_station is not None:
+                    station_obj = stations.get(current_station)
+                    station_name = station_obj.name if station_obj else current_station
+                    
+                    start_date = selected_intern.start_date + timedelta(days=30 * start_month)
+                    end_date = selected_intern.start_date + timedelta(days=30 * (month_idx + 1))
+                    
+                    df_data.append({
+                        'Station': station_name,
+                        'Start': start_date,
+                        'End': end_date
+                    })
+                
+                if df_data:
+                    df_timeline = pd.DataFrame(df_data)
+                    fig_personal = px.timeline(df_timeline, x_start="Start", x_end="End", y="Station",
+                                              title=f"{selected_intern.name}'s Schedule Timeline")
+                    fig_personal.update_yaxes(categoryorder="total ascending")
+                    fig_personal.update_layout(height=400)
+                    st.plotly_chart(fig_personal, use_container_width=True)
+                else:
+                    st.info("No timeline data available")
+            else:
+                st.info("No assignments to display")
+
+# ==================== TAB 6: RULES ENGINE ====================
+with tab6:
+    st.subheader("⚙️ Rules Engine - Dynamic Configuration")
+    st.caption("Modify program constraints and rules in real-time")
+    
+    col_rules1, col_rules2 = st.columns([2, 1])
+    
+    with col_rules1:
+        st.markdown("### 📋 Station Configuration")
+        st.caption("Edit capacity limits and duration requirements")
+        
+        # Get station list for Model A
+        station_list = st.session_state.program_config.get_station_list(model='A')
+        df_stations = pd.DataFrame(station_list)
+        
+        # Create editable dataframe
+        edited_stations = st.data_editor(
+            df_stations,
+            use_container_width=True,
+            height=400,
+            column_config={
+                "key": st.column_config.TextColumn("Key", disabled=True),
+                "name": st.column_config.TextColumn("Station Name", disabled=True),
+                "duration": st.column_config.NumberColumn("Duration (months)", min_value=0, max_value=24, step=1),
+                "min_interns": st.column_config.NumberColumn("Min Interns", min_value=0, max_value=10, step=1),
+                "max_interns": st.column_config.NumberColumn("Max Interns", min_value=0, max_value=999, step=1),
+                "splittable": st.column_config.CheckboxColumn("Allow Split")
+            },
+            disabled=["key", "name"],
+            key="station_config_editor"
+        )
+    
+    with col_rules2:
+        st.markdown("### 🎛️ Global Rules")
+        
+        current_config = st.session_state.program_config.get_config()
+        
+        st.markdown("#### Stage A Timing")
+        stage_a_min = st.number_input(
+            "Min months from start",
+            min_value=24,
+            max_value=60,
+            value=current_config.get('stage_a_min_months', 36),
+            step=1,
+            key="stage_a_min"
+        )
+        
+        stage_a_max = st.number_input(
+            "Max months from start",
+            min_value=24,
+            max_value=60,
+            value=current_config.get('stage_a_max_months', 54),
+            step=1,
+            key="stage_a_max"
+        )
+        
+        st.markdown("#### Stage B Timing")
+        stage_b_min_from_end = st.number_input(
+            "Min months from end",
+            min_value=1,
+            max_value=24,
+            value=current_config.get('stage_b_min_months_from_end', 1),
+            step=1,
+            key="stage_b_min_end"
+        )
+        
+        stage_b_max_from_end = st.number_input(
+            "Max months from end",
+            min_value=1,
+            max_value=24,
+            value=current_config.get('stage_b_max_months_from_end', 12),
+            step=1,
+            key="stage_b_max_end"
+        )
+        
+        st.markdown("#### Constraints")
+        allow_split = st.checkbox(
+            "Allow Split Rotations",
+            value=current_config.get('allow_split_rotations', True),
+            key="allow_split"
+        )
+        
+        enforce_dept = st.checkbox(
+            "Enforce Department Split (A/B)",
+            value=current_config.get('enforce_department_split', True),
+            key="enforce_dept"
+        )
+        
+        st.markdown("#### Maternity Leave")
+        mat_leave_limit = st.number_input(
+            "Deduction Limit (months)",
+            min_value=0,
+            max_value=12,
+            value=current_config.get('maternity_leave_deduction_limit', 6),
+            step=1,
+            key="mat_leave_limit",
+            help="Max months to deduct from Department before extending program"
+        )
+    
+    # Apply button
+    st.divider()
+    col_apply1, col_apply2, col_apply3 = st.columns([1, 2, 1])
+    
+    with col_apply2:
+        if st.button("🔄 Update Rules & Re-validate", type="primary", use_container_width=True):
+            with st.spinner("Updating configuration and re-validating..."):
+                try:
+                    # Update station configurations
+                    for _, row in edited_stations.iterrows():
+                        st.session_state.program_config.update_station(
+                            row['key'],
+                            duration_months=int(row['duration']),
+                            min_interns=int(row['min_interns']),
+                            max_interns=int(row['max_interns']),
+                            splittable=bool(row['splittable'])
+                        )
+                    
+                    # Update global config
+                    st.session_state.program_config.update_config({
+                        'stage_a_min_months': stage_a_min,
+                        'stage_a_max_months': stage_a_max,
+                        'stage_b_min_months_from_end': stage_b_min_from_end,
+                        'stage_b_max_months_from_end': stage_b_max_from_end,
+                        'allow_split_rotations': allow_split,
+                        'enforce_department_split': enforce_dept,
+                        'maternity_leave_deduction_limit': mat_leave_limit,
+                    })
+                    
+                    st.success("✅ Rules updated successfully!")
+                    st.toast("✅ Configuration updated!", icon="✅")
+                    
+                    # Re-validate with new rules
+                    if st.session_state.interns:
+                        validator = ScheduleValidator(st.session_state.interns, use_ai=False, program_config=st.session_state.program_config)
+                        validation_result = validator.validate(current_date=st.session_state.current_date)
+                        
+                        st.divider()
+                        st.markdown("### 🔍 Re-validation Results")
+                        
+                        col_v1, col_v2, col_v3 = st.columns(3)
+                        with col_v1:
+                            st.metric("Errors", len(validation_result.errors))
+                        with col_v2:
+                            st.metric("Warnings", len(validation_result.warnings))
+                        with col_v3:
+                            status = "✅ Valid" if validation_result.is_valid else "❌ Invalid"
+                            st.metric("Status", status)
+                        
+                        if validation_result.errors:
+                            st.error(f"🔴 {len(validation_result.errors)} errors found with new rules")
+                            with st.expander("View Errors"):
+                                for error in validation_result.errors[:10]:
+                                    st.write(f"- {error}")
+                        
+                        if validation_result.warnings:
+                            st.warning(f"🟡 {len(validation_result.warnings)} warnings with new rules")
+                        
+                        if validation_result.is_valid:
+                            st.success("✅ All schedules are valid with new rules!")
+                            st.balloons()
+                    
+                    st.toast("🔄 Re-calculation complete!", icon="🔄")
+                    
+                    # Don't rerun - keep data displayed
+                    
+                except Exception as e:
+                    st.error(f"Error updating rules: {str(e)}")
+                    st.toast("❌ Update failed", icon="❌")
+    
+    # Reset button
+    col_reset1, col_reset2, col_reset3 = st.columns([1, 2, 1])
+    with col_reset2:
+        if st.button("↺ Reset to Defaults", use_container_width=True):
+            st.session_state.program_config.reset_to_defaults()
+            st.success("✅ Configuration reset to defaults")
+            st.toast("↺ Reset complete", icon="↺")
+            st.info("💡 Reload the page (F5) to see default values in the editor")
+    
+    # Show current config summary
+    st.divider()
+    with st.expander("📊 Current Configuration Summary", expanded=False):
+        config_dict = st.session_state.program_config.get_config()
+        
+        st.markdown("**Stage A:**")
+        st.write(f"- Months from start: {config_dict['stage_a_min_months']}-{config_dict['stage_a_max_months']}")
+        st.write(f"- Allowed months: {config_dict['stage_a_months']}")
+        
+        st.markdown("**Stage B:**")
+        st.write(f"- Months from end: {config_dict['stage_b_min_months_from_end']}-{config_dict['stage_b_max_months_from_end']}")
+        st.write(f"- Allowed months: {config_dict['stage_b_months']}")
+        
+        st.markdown("**Constraints:**")
+        st.write(f"- Allow split rotations: {config_dict.get('allow_split_rotations', True)}")
+        st.write(f"- Enforce department split: {config_dict.get('enforce_department_split', True)}")
+        st.write(f"- Maternity leave deduction limit: {config_dict['maternity_leave_deduction_limit']} months")
 
 # ==================== FOOTER ====================
 st.divider()

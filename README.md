@@ -66,7 +66,7 @@ ResiPlanAI/
 │   ├── audit_export.py
 │   ├── bottleneck_analyzer.py
 │   ├── visual_timeline.py
-│   └── translation_config.py  # Hebrew translation (NEW)
+│   └── normalization_config.py  # Hebrew normalization (NEW)
 │
 ├── docs/                  # Documentation
 │   ├── QUICKSTART.md
