@@ -681,16 +681,30 @@ INSTRUCTIONS:
 
 # ==================== MAIN DASHBOARD ====================
 
-# Header
-st.markdown("""
-<div class="main-header">
-    <h1>🏥 ResiPlanAI</h1>
-    <p>AI-Powered Residency Program Scheduler</p>
-</div>
-""", unsafe_allow_html=True)
+# Header with Logo
+logo_path = os.path.join(os.path.dirname(__file__), 'assets', 'logo.png')
+if os.path.exists(logo_path):
+    col_logo, col_space = st.columns([1, 3])
+    with col_logo:
+        st.image(logo_path, width=300)
+    st.markdown("<br>", unsafe_allow_html=True)
+else:
+    # Fallback header if logo not found
+    st.markdown("""
+    <div class="main-header">
+        <h1>🏥 ResiPlanAI</h1>
+        <p>AI-Powered Residency Program Scheduler</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 # ==================== SIDEBAR ====================
 with st.sidebar:
+    # Sidebar logo
+    logo_path = os.path.join(os.path.dirname(__file__), 'assets', 'logo.png')
+    if os.path.exists(logo_path):
+        st.image(logo_path, use_container_width=True)
+        st.divider()
+    
     st.header("⚙️ Configuration")
     
     # File upload
@@ -1365,6 +1379,93 @@ with tab5:
             </div>
             """
             st.markdown(progress_html, unsafe_allow_html=True)
+            
+            # Edit Profile Section
+            with st.expander("✏️ ערוך פרטי מתמחה", expanded=False):
+                st.markdown("##### עדכון פרטי מתמחה")
+                st.caption("שינוי תאריך התחלה ידרוש חישוב מחדש של אינדקס החודש הנוכחי")
+                
+                with st.form(f"edit_intern_form_{selected_intern.name}", clear_on_submit=False):
+                    edit_name = st.text_input("שם מלא", value=selected_intern.name, key=f"edit_name_{selected_intern.name}")
+                    edit_email = st.text_input("אימייל", value=selected_intern.email if selected_intern.email else "", 
+                                               key=f"edit_email_{selected_intern.name}")
+                    
+                    col_edit1, col_edit2 = st.columns(2)
+                    with col_edit1:
+                        edit_department = st.selectbox("מחלקה", ["A", "B"], 
+                                                       index=0 if selected_intern.department == "A" else 1,
+                                                       key=f"edit_dept_{selected_intern.name}")
+                    with col_edit2:
+                        edit_model = st.selectbox("מודל", ["A", "B"], 
+                                                  index=0 if selected_intern.model == "A" else 1,
+                                                  key=f"edit_model_{selected_intern.name}")
+                    
+                    edit_start_date = st.date_input("תאריך התחלה", 
+                                                    value=selected_intern.start_date.date(),
+                                                    key=f"edit_start_{selected_intern.name}")
+                    
+                    col_save1, col_save2 = st.columns([2, 1])
+                    with col_save1:
+                        save_profile_btn = st.form_submit_button("💾 שמור שינויים", type="primary", use_container_width=True)
+                    with col_save2:
+                        if st.form_submit_button("↺ איפוס", type="secondary", use_container_width=True):
+                            st.rerun()
+                    
+                    if save_profile_btn:
+                        try:
+                            # Find the intern in session state
+                            intern_idx = next((i for i, intern in enumerate(st.session_state.interns) 
+                                              if intern.name == selected_intern.name), None)
+                            
+                            if intern_idx is not None:
+                                intern_to_update = st.session_state.interns[intern_idx]
+                                
+                                # Check if start date changed
+                                new_start_date = datetime.combine(edit_start_date, datetime.min.time())
+                                start_date_changed = new_start_date != intern_to_update.start_date
+                                
+                                # Update basic fields
+                                intern_to_update.name = edit_name.strip()
+                                intern_to_update.email = edit_email.strip()
+                                intern_to_update.department = edit_department
+                                
+                                # Handle model change
+                                if edit_model != intern_to_update.model:
+                                    intern_to_update.model = edit_model
+                                    intern_to_update.total_months = 72 if edit_model == "A" else 66
+                                
+                                # Handle start date change
+                                if start_date_changed:
+                                    intern_to_update.start_date = new_start_date
+                                    
+                                    # Recalculate current_month_index based on simulation date
+                                    current_date = st.session_state.current_date
+                                    months_elapsed = (current_date.year - new_start_date.year) * 12 + (current_date.month - new_start_date.month)
+                                    
+                                    # Find the highest month_idx that is <= months_elapsed
+                                    current_month_index = 0
+                                    for month_idx in sorted(intern_to_update.assignments.keys()):
+                                        if month_idx <= months_elapsed:
+                                            current_month_index = month_idx
+                                    
+                                    intern_to_update.current_month_index = current_month_index
+                                
+                                # Recalculate leave counts
+                                intern_to_update.calculate_leave_counts()
+                                
+                                st.success(f"✅ הפרטים של {edit_name} עודכנו בהצלחה!")
+                                st.toast(f"✅ {edit_name} עודכן", icon="✅")
+                                
+                                if start_date_changed:
+                                    st.info(f"ℹ️ תאריך ההתחלה שונה. אינדקס החודש הנוכחי: {intern_to_update.current_month_index}")
+                                
+                                # Rerun to refresh the display
+                                st.rerun()
+                            else:
+                                st.error("❌ שגיאה: לא ניתן למצוא את המתמחה")
+                        
+                        except Exception as e:
+                            st.error(f"❌ שגיאה בעדכון הפרטים: {str(e)}")
             
             st.markdown("---")
             

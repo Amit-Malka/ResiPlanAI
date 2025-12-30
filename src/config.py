@@ -25,6 +25,8 @@ STATIONS_MODEL_A = {
     'מיון נשים': Station('מיון נשים', 3, 1, 3, '#FFA07A', False),
     'א.יום גינקולוגי': Station('א.יום גינקולוגי', 3, 1, 2, '#E6E6FA', False),
     'א.יום מיילדותי': Station('א.יום מיילדותי', 3, 1, 2, '#F0E68C', False),
+    'א. יום מיילד': Station('א. יום מיילד', 3, 1, 2, '#F0E68C', False),  # Alias for midwifery day
+    'אשפוז יום': Station('אשפוז יום', 3, 1, 2, '#E6E6FA', False),  # Day hospitalization
     'מדעי היסוד': Station('מדעי היסוד', 5, 0, 999, '#D3D3D3', False),
     'רוטציה א': Station('רוטציה א', 3, 0, 999, '#FFDAB9', False),
     'שלב א': Station('שלב א', 0, 0, 999, '#FF4500', False),
@@ -50,7 +52,12 @@ AFTER_STAGE_A = ['אחראי מיון יולדות']
 PREFER_AFTER_STAGE_A = ['IVF']
 
 # Stations that cannot be split
-NO_SPLIT_ALLOWED = ['IVF']
+NO_SPLIT_ALLOWED = ['IVF', 'א.יום מיילדותי', 'א. יום מיילד', 'אשפוז יום']
+
+# Stations with variable duration (min, max months)
+VARIABLE_DURATION_STATIONS = {
+    'גינקואונקולוגיה': (1, 2)  # Gynecologic oncology: 1-2 months accepted
+}
 
 # Department-specific stations
 DEPARTMENT_A_STATIONS = ['הריון בסיכון א', 'גינקולוגיה א']
@@ -132,6 +139,7 @@ class ProgramConfiguration:
             'after_stage_a': copy.deepcopy(AFTER_STAGE_A),
             'prefer_after_stage_a': copy.deepcopy(PREFER_AFTER_STAGE_A),
             'no_split_allowed': copy.deepcopy(NO_SPLIT_ALLOWED),
+            'variable_duration_stations': copy.deepcopy(VARIABLE_DURATION_STATIONS),
             'department_a_stations': copy.deepcopy(DEPARTMENT_A_STATIONS),
             'department_b_stations': copy.deepcopy(DEPARTMENT_B_STATIONS),
             'maternity_leave_deduction_limit': MATERNITY_LEAVE_DEDUCTION_LIMIT,
