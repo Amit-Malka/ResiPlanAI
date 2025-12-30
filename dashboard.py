@@ -66,6 +66,10 @@ if 'schedule_generated' not in st.session_state:
     st.session_state.schedule_generated = False
 if 'edited_df' not in st.session_state:
     st.session_state.edited_df = None
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'bottleneck_summary' not in st.session_state:
+    st.session_state.bottleneck_summary = None
 
 # Helper Functions
 def parse_uploaded_file(uploaded_file, current_date):
@@ -266,32 +270,256 @@ def run_scheduler(interns, current_date, time_limit):
     except Exception as e:
         return None, str(e)
 
-def apply_dataframe_edits(interns, edited_df):
-    """Apply manual edits from data editor back to Intern objects."""
+def sync_editor_changes(edited_df):
+    """
+    Sync changes from data editor back to Intern objects in session state.
+    Returns (success, message, updated_count).
+    """
     try:
-        station_name_to_key = {}
+        updated_count = 0
+        errors = []
+        
+        # Build station name to key mappings for both models
+        station_name_to_key_a = {}
+        station_name_to_key_b = {}
+        
         for station_key, station in config.STATIONS_MODEL_A.items():
-            station_name_to_key[station.name] = station_key
+            station_name_to_key_a[station.name.strip().lower()] = station_key
         
-        for intern in interns:
-            if intern.name in edited_df.columns:
-                stations = config.STATIONS_MODEL_A if intern.model == 'A' else config.STATIONS_MODEL_B
+        for station_key, station in config.STATIONS_MODEL_B.items():
+            station_name_to_key_b[station.name.strip().lower()] = station_key
+        
+        # Iterate through each intern in session state
+        for intern in st.session_state.interns:
+            if intern.name not in edited_df.columns:
+                continue
+            
+            # Get appropriate station mapping for this intern's model
+            station_mapping = station_name_to_key_a if intern.model == 'A' else station_name_to_key_b
+            stations_config = config.STATIONS_MODEL_A if intern.model == 'A' else config.STATIONS_MODEL_B
+            
+            # Update assignments for each month
+            changes_made = False
+            for month_idx, station_name in enumerate(edited_df[intern.name]):
+                # Skip empty cells
+                if pd.isna(station_name) or not str(station_name).strip():
+                    # Remove assignment if it exists
+                    if month_idx in intern.assignments:
+                        del intern.assignments[month_idx]
+                        changes_made = True
+                    continue
                 
-                for month_idx, station_name in enumerate(edited_df[intern.name]):
-                    if pd.notna(station_name) and station_name.strip():
-                        # Find matching station key
-                        station_key = None
-                        for key, station in stations.items():
-                            if station.name == station_name.strip():
-                                station_key = key
-                                break
-                        
-                        if station_key:
-                            intern.assignments[month_idx] = station_key
+                # Normalize station name
+                station_name_normalized = str(station_name).strip().lower()
+                
+                # Find matching station key
+                station_key = None
+                
+                # First try direct mapping
+                if station_name_normalized in station_mapping:
+                    station_key = station_mapping[station_name_normalized]
+                else:
+                    # Try partial match
+                    for key, station in stations_config.items():
+                        if station_name_normalized in station.name.lower() or station.name.lower() in station_name_normalized:
+                            station_key = key
+                            break
+                
+                if station_key:
+                    # Check if this is a change
+                    if month_idx not in intern.assignments or intern.assignments[month_idx] != station_key:
+                        intern.assignments[month_idx] = station_key
+                        changes_made = True
+                else:
+                    errors.append(f"{intern.name}, Month {month_idx}: Unknown station '{station_name}'")
+            
+            if changes_made:
+                updated_count += 1
         
-        return True, "Edits applied successfully"
+        if errors:
+            error_msg = "\n".join(errors[:5])  # Show first 5 errors
+            if len(errors) > 5:
+                error_msg += f"\n... and {len(errors) - 5} more errors"
+            return False, f"Partial sync completed with errors:\n{error_msg}", updated_count
+        
+        return True, f"✓ Successfully updated {updated_count} intern schedules", updated_count
+    
     except Exception as e:
-        return False, f"Error applying edits: {str(e)}"
+        import traceback
+        return False, f"Error syncing changes: {str(e)}\n{traceback.format_exc()}", 0
+
+def get_ai_response(user_input, context):
+    """Mock AI response function for hackathon demo."""
+    user_input_lower = user_input.lower()
+    
+    # Extract context information
+    total_interns = context.get('total_interns', 0)
+    critical_stations = context.get('critical_stations', [])
+    bottleneck_count = context.get('bottleneck_count', 0)
+    
+    # Keyword-based smart responses
+    if any(word in user_input_lower for word in ['help', 'what can you do', 'capabilities', 'how']):
+        return f"""I'm ResiPlan Copilot, your AI scheduling assistant! 🤖
+
+I can help you with:
+- **Analyzing bottlenecks** in your {total_interns}-intern schedule
+- **Suggesting solutions** for capacity issues
+- **Explaining constraints** and rotation requirements
+- **Optimizing assignments** to balance workload
+
+Currently tracking: {bottleneck_count} potential bottlenecks
+Just ask me about any scheduling issue!"""
+
+    elif any(word in user_input_lower for word in ['bottleneck', 'problem', 'issue', 'warning']):
+        if critical_stations:
+            stations_text = ", ".join(critical_stations[:3])
+            return f"""🔴 **Critical Capacity Issues Detected**
+
+Based on current analysis, I see bottlenecks in:
+- {stations_text}
+
+**Recommended Actions:**
+1. Run the AI Scheduler to automatically rebalance assignments
+2. Check the "Analytics & Bottlenecks" tab for detailed month-by-month breakdown
+3. Consider extending rotation durations or adjusting start dates
+
+Would you like specific suggestions for any station?"""
+        else:
+            return f"✅ Good news! No critical bottlenecks detected in your schedule. Your {total_interns} interns are well-distributed across stations."
+
+    elif any(word in user_input_lower for word in ['july', 'june', 'month', 'when']):
+        months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 
+                  'September', 'October', 'November', 'December']
+        mentioned_month = next((m for m in months if m.lower() in user_input_lower), 'the mentioned month')
+        
+        return f"""📅 **{mentioned_month} Analysis**
+
+Common issues in {mentioned_month}:
+- Stage A exams (June only) - ensure Basic Sciences completed
+- Vacation conflicts - verify leave schedules
+- Capacity crunches - check staffing minimums
+
+**Quick Fix:**
+1. Go to "Interactive Editor" tab
+2. Review {mentioned_month} column
+3. Manually adjust assignments if needed
+4. Click "Apply Edits" to save
+
+Check the "God View" tab for visual timeline!"""
+
+    elif any(word in user_input_lower for word in ['intern', 'resident', 'who', 'assign']):
+        return f"""👥 **Intern Management**
+
+Currently managing {total_interns} residents in the system.
+
+**To view individual schedules:**
+- Go to "Interactive Editor" tab
+- Each column shows one intern's full schedule
+- Edit cells directly to reassign rotations
+
+**To optimize assignments:**
+- Click "🚀 Run AI Scheduler" in sidebar
+- The solver will automatically balance {total_interns} residents across all stations
+- Respects all constraints (duration, capacity, sequencing)"""
+
+    elif any(word in user_input_lower for word in ['capacity', 'staff', 'shortage', 'understaffed']):
+        if critical_stations:
+            return f"""⚠️ **Capacity Issues Identified**
+
+Understaffed stations: {", ".join(critical_stations)}
+
+**Solutions:**
+1. **Automated**: Run AI Scheduler to rebalance
+2. **Manual**: Go to Interactive Editor, move residents from overstaffed to understaffed stations
+3. **Relaxed Mode**: If solver fails, it will automatically try relaxed constraints
+
+The system enforces:
+- Min/Max capacity per station
+- Required rotation durations
+- Sequential dependencies"""
+        else:
+            return f"✅ All stations are adequately staffed! Your {total_interns} interns meet capacity requirements across all rotations."
+
+    elif any(word in user_input_lower for word in ['constraint', 'rule', 'requirement', 'must']):
+        return """📋 **Scheduling Constraints**
+
+The system enforces these hard rules:
+1. **Duration**: HRP (6mo), Birth (6mo), Gyn (6mo), IVF (6mo)
+2. **Capacity**: Each station has min/max intern limits
+3. **Sequencing**: Basic Sciences → Stage A → Stage B
+4. **Stage A Timing**: June only, 3-4.5 years from start
+5. **Stage B Timing**: Nov/March, final year only
+6. **Immutable Past**: Cannot change past/current months
+7. **Department**: Respect A/B assignments
+
+**Soft preferences:**
+- Consecutive months for same station (continuity)
+- Balance workload across residents"""
+
+    elif any(word in user_input_lower for word in ['optimize', 'improve', 'better', 'solution']):
+        return f"""💡 **Optimization Strategies**
+
+For your {total_interns}-intern program:
+
+**Immediate Actions:**
+1. Run "🚀 AI Scheduler" (uses OR-Tools constraint solver)
+2. Set time limit 300+ seconds for better solutions
+3. Check "Analytics & Bottlenecks" tab for red flags
+
+**Manual Tuning:**
+- Use "Interactive Editor" to fine-tune AI results
+- Focus on months with critical issues first
+- Verify Stage A/B timing compliance
+
+**Advanced:**
+- If solver fails, it automatically relaxes capacity constraints
+- Export PDF audit report for documentation
+- Review bottleneck forecast to prevent future issues"""
+
+    elif any(word in user_input_lower for word in ['error', 'fail', 'not working', 'problem']):
+        return """🔧 **Troubleshooting Guide**
+
+Common issues and fixes:
+
+**Solver fails:**
+- Increase time limit (try 600 seconds)
+- Check if constraints are achievable
+- System will auto-try relaxed mode
+
+**Excel won't load:**
+- Verify format: Names in row 1, column B+
+- Metadata in rows 82-84
+- File not corrupted
+
+**Edits not saving:**
+- Click "💾 Apply Edits" button
+- Station names must match exactly
+- Refresh page if UI freezes
+
+**Visual errors:**
+- Reload page
+- Check browser console (F12)
+- Try different browser"""
+
+    elif any(word in user_input_lower for word in ['thank', 'thanks', 'great', 'good']):
+        return "You're welcome! Happy to help optimize your residency program. Feel free to ask anything else! 😊"
+
+    else:
+        # Default intelligent response
+        return f"""I understand you're asking about: "{user_input}"
+
+**Quick Context:**
+- Managing {total_interns} residents
+- {bottleneck_count} potential bottlenecks detected
+{f"- Critical stations: {', '.join(critical_stations)}" if critical_stations else "- All stations adequately staffed"}
+
+**I can help with:**
+- Analyzing specific months or stations
+- Explaining constraints and rules
+- Suggesting optimization strategies
+- Troubleshooting scheduling issues
+
+Could you be more specific about what you'd like to know?"""
 
 # ==================== MAIN DASHBOARD ====================
 
@@ -379,6 +607,77 @@ with st.sidebar:
         col1, col2 = st.columns(2)
         col1.metric("Model A", model_a)
         col2.metric("Model B", model_b)
+    
+    # AI Advisory Chat
+    st.divider()
+    col_header1, col_header2 = st.columns([3, 1])
+    with col_header1:
+        st.header("🤖 ResiPlan Copilot")
+    with col_header2:
+        if st.button("🗑️", help="Clear chat", key="clear_chat"):
+            st.session_state.messages = []
+            st.rerun()
+    
+    st.caption("Ask me anything about your schedule!")
+    
+    # Display chat history
+    chat_container = st.container(height=300)
+    with chat_container:
+        # Show welcome message if no messages
+        if not st.session_state.messages:
+            with st.chat_message("assistant"):
+                st.write("""👋 Hi! I'm your AI scheduling assistant.
+
+I can help you:
+- Analyze bottlenecks
+- Explain constraints
+- Suggest optimizations
+- Troubleshoot issues
+
+Try asking: *"What bottlenecks do I have?"* or *"How can I optimize my schedule?"*""")
+        
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask about bottlenecks, constraints, or optimization..."):
+        # Add user message to history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Build context for AI
+        context = {
+            'total_interns': len(st.session_state.interns),
+            'bottleneck_count': 0,
+            'critical_stations': []
+        }
+        
+        # Get bottleneck info if available
+        if st.session_state.interns:
+            try:
+                analyzer = BottleneckAnalyzer(st.session_state.interns, lookahead_months=12)
+                analysis = analyzer.analyze()
+                context['bottleneck_count'] = analysis['bottlenecks_found']
+                
+                # Extract critical stations
+                for bottleneck in analysis.get('bottlenecks', []):
+                    for issue in bottleneck.get('issues', []):
+                        if issue.get('severity') == 'critical':
+                            context['critical_stations'].append(issue.get('station', 'Unknown'))
+                
+                # Remove duplicates
+                context['critical_stations'] = list(set(context['critical_stations']))
+            except:
+                pass
+        
+        # Get AI response
+        response = get_ai_response(prompt, context)
+        
+        # Add assistant response to history
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # Rerun to display new messages
+        st.rerun()
 
 # ==================== MAIN CONTENT ====================
 
@@ -409,13 +708,28 @@ with tab1:
 # ==================== TAB 2: INTERACTIVE EDITOR ====================
 with tab2:
     st.subheader("Manual Schedule Editor")
-    st.caption("Edit cells directly to modify assignments. Changes are applied when you click 'Apply Edits'.")
+    st.caption("Edit cells directly to modify assignments. Changes are applied when you click 'Save & Re-validate'.")
     
     if st.session_state.interns:
         # Convert to DataFrame
         df = interns_to_dataframe(st.session_state.interns)
         
         if not df.empty:
+            # Info box with instructions
+            with st.expander("📖 How to Edit", expanded=False):
+                st.markdown("""
+                **Instructions:**
+                1. Click any cell to edit the station assignment
+                2. Enter station name (e.g., "HRP A", "Birth", "Gynecology A")
+                3. Leave cell empty to remove assignment
+                4. Click "💾 Save & Re-validate" when done
+                
+                **Available Stations:**
+                - Orientation, Maternity, HRP A/B, Birth, Gynecology A/B
+                - Maternity ER, Women's ER, Gynecology Day, Midwifery Day
+                - Basic Sciences, Stage A, Stage B, IVF, Gyneco-Oncology
+                """)
+            
             # Display editable dataframe
             edited_df = st.data_editor(
                 df,
@@ -425,17 +739,86 @@ with tab2:
                 key="schedule_editor"
             )
             
-            # Apply edits button
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                if st.button("💾 Apply Edits", type="primary", use_container_width=True):
-                    success, message = apply_dataframe_edits(st.session_state.interns, edited_df)
+            # Save & Re-validate button
+            st.divider()
+            col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+            with col_btn2:
+                save_button = st.button("💾 Save & Re-validate", type="primary", use_container_width=True,
+                                       help="Apply changes and re-run bottleneck analysis")
+            
+            if save_button:
+                with st.spinner("🔄 Syncing changes to intern schedules..."):
+                    # Sync changes to intern objects
+                    success, message, updated_count = sync_editor_changes(edited_df)
+                    
                     if success:
+                        st.toast(f"✓ Updated {updated_count} schedules! Validating...", icon="✅")
+                        
+                        # Show sync summary
                         st.success(message)
-                        st.session_state.edited_df = edited_df
+                        
+                        # Re-run bottleneck analysis
+                        with st.spinner("🔍 Running bottleneck analysis..."):
+                            try:
+                                analyzer = BottleneckAnalyzer(st.session_state.interns, lookahead_months=12)
+                                analysis = analyzer.analyze()
+                                st.session_state.bottleneck_summary = analysis
+                                
+                                # Show detailed validation results
+                                col_v1, col_v2, col_v3 = st.columns(3)
+                                with col_v1:
+                                    st.metric("Bottlenecks", analysis['bottlenecks_found'])
+                                with col_v2:
+                                    st.metric("Critical", analysis['critical_count'], 
+                                             delta=f"-{analysis['critical_count']}" if analysis['critical_count'] > 0 else None,
+                                             delta_color="inverse")
+                                with col_v3:
+                                    st.metric("Warnings", analysis['warning_count'],
+                                             delta=f"-{analysis['warning_count']}" if analysis['warning_count'] > 0 else None,
+                                             delta_color="inverse")
+                                
+                                # Show status message
+                                if analysis['critical_count'] > 0:
+                                    st.warning(f"⚠️ {analysis['critical_count']} critical capacity issues detected. Review Tab 3 (Analytics) for details.")
+                                    st.toast(f"⚠️ {analysis['critical_count']} critical issues", icon="⚠️")
+                                elif analysis['warning_count'] > 0:
+                                    st.info(f"🟡 {analysis['warning_count']} warnings detected. Schedule is mostly valid.")
+                                    st.toast(f"🟡 {analysis['warning_count']} warnings", icon="🟡")
+                                else:
+                                    st.success("✅ No bottlenecks detected! Schedule looks great.")
+                                    st.toast("✅ Perfect schedule - no conflicts!", icon="✅")
+                                    st.balloons()
+                                
+                            except Exception as e:
+                                st.error(f"Validation error: {str(e)}")
+                                st.toast("⚠️ Saved but validation failed", icon="⚠️")
+                        
+                        # Force rerun to refresh all visualizations
+                        st.session_state.edited_df = edited_df.copy()
+                        
+                        # Wait a moment before rerun
+                        import time
+                        time.sleep(0.5)
                         st.rerun()
                     else:
                         st.error(message)
+                        st.toast("❌ Sync failed - check error details above", icon="❌")
+            
+            # Show last sync info and change detection
+            if st.session_state.edited_df is not None:
+                st.divider()
+                col_info1, col_info2 = st.columns([3, 1])
+                with col_info1:
+                    st.caption("💡 **Tip:** After saving, check Tab 1 (God View) and Tab 3 (Analytics) for updated visualizations.")
+                with col_info2:
+                    # Check if dataframe has unsaved changes
+                    try:
+                        if not edited_df.equals(st.session_state.edited_df):
+                            st.warning("⚠️ Unsaved changes")
+                        else:
+                            st.success("✓ All saved")
+                    except:
+                        pass
         else:
             st.warning("No schedule data to display")
     else:
@@ -449,6 +832,9 @@ with tab3:
         try:
             analyzer = BottleneckAnalyzer(st.session_state.interns, lookahead_months=12)
             analysis = analyzer.analyze()
+            
+            # Store in session state for AI chat
+            st.session_state.bottleneck_summary = analysis
             
             # Metrics
             col1, col2, col3, col4 = st.columns(4)

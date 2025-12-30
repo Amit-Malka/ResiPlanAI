@@ -12,6 +12,7 @@ AI-powered scheduling system for Obstetrics & Gynecology residency programs.
 - **AI Validation**: Google Generative AI provides suggestions for constraint violations
 - **Excel Editing**: Direct in-browser editing of schedules (Streamlit)
 - **Hebrew Translation**: Automatic translation of Hebrew names and stations
+- **AI Copilot**: Context-aware chat assistant for scheduling advice (NEW)
 
 ## Quick Start
 

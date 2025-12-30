@@ -38,6 +38,7 @@ The dashboard will open automatically in your default browser at `http://localho
 - **⏱️ Max Runtime**: Adjust AI scheduler timeout (60-600 seconds)
 - **📥 Load Data**: Parse and load the Excel file
 - **🚀 Run AI Scheduler**: Generate optimized schedules
+- **🤖 ResiPlan Copilot**: AI chat assistant for scheduling advice (NEW!)
 
 ### Tab 1: God View (Timeline)
 **Visual 72-Month Overview**
@@ -92,6 +93,16 @@ The dashboard will open automatically in your default browser at `http://localho
 2. Click on any cell to change the station assignment
 3. Click "💾 Apply Edits" to save your changes
 4. The visualizations will update automatically
+
+### 6. Use AI Copilot (NEW!)
+1. Scroll to bottom of sidebar
+2. Find **"🤖 ResiPlan Copilot"** section
+3. Type questions like:
+   - "What bottlenecks do I have?"
+   - "How can I optimize my schedule?"
+   - "Explain Stage A constraints"
+4. Get instant context-aware advice
+5. Clear chat with 🗑️ button if needed
 
 ---
 
