@@ -5,6 +5,11 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import sys
 import os
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -348,178 +353,262 @@ def sync_editor_changes(edited_df):
         import traceback
         return False, f"Error syncing changes: {str(e)}\n{traceback.format_exc()}", 0
 
-def get_ai_response(user_input, context):
-    """Mock AI response function for hackathon demo."""
-    user_input_lower = user_input.lower()
+# ==================== AI AGENT TOOLS ====================
+
+def tool_get_intern_schedule(interns, intern_name):
+    """Tool: Get full schedule for a specific intern."""
+    if not interns:
+        return "No interns loaded in the system."
     
+    # Find intern by name (case-insensitive partial match)
+    intern_name_lower = intern_name.lower()
+    matching_interns = [i for i in interns if intern_name_lower in i.name.lower()]
+    
+    if not matching_interns:
+        available_names = [i.name for i in interns]
+        return f"No intern found matching '{intern_name}'. Available interns: {', '.join(available_names)}"
+    
+    results = []
+    for intern in matching_interns:
+        # Build schedule info
+        schedule_lines = [
+            f"**{intern.name}**",
+            f"- Model: {intern.model} ({intern.total_months} months total)",
+            f"- Department: {intern.department}",
+            f"- Start Date: {intern.start_date.strftime('%B %Y')}",
+            f"- Current Month Index: {intern.current_month_index}",
+            "",
+            "Schedule (month index -> station):"
+        ]
+        
+        # Sort assignments by month index
+        sorted_assignments = sorted(intern.assignments.items())
+        for month_idx, station in sorted_assignments:
+            # Calculate actual date for this month
+            actual_date = intern.start_date + timedelta(days=month_idx * 30)
+            month_str = actual_date.strftime('%b %Y')
+            schedule_lines.append(f"  Month {month_idx} ({month_str}): {station}")
+        
+        results.append("\n".join(schedule_lines))
+    
+    return "\n\n".join(results)
+
+
+def tool_get_station_assignments(interns, station_name, month_year=None):
+    """Tool: Get all interns assigned to a station, optionally filtered by month."""
+    if not interns:
+        return "No interns loaded in the system."
+    
+    station_name_lower = station_name.lower()
+    results = []
+    
+    for intern in interns:
+        for month_idx, station in intern.assignments.items():
+            # Check if station matches (case-insensitive partial match)
+            if station_name_lower in station.lower():
+                # Calculate actual date
+                actual_date = intern.start_date + timedelta(days=month_idx * 30)
+                month_str = actual_date.strftime('%B %Y')
+                
+                # Filter by month_year if provided
+                if month_year:
+                    month_year_lower = month_year.lower()
+                    if month_year_lower not in month_str.lower():
+                        continue
+                
+                results.append({
+                    'intern': intern.name,
+                    'station': station,
+                    'month_idx': month_idx,
+                    'month_str': month_str
+                })
+    
+    if not results:
+        filter_info = f" in {month_year}" if month_year else ""
+        return f"No interns found assigned to '{station_name}'{filter_info}."
+    
+    # Group by month for better readability
+    by_month = {}
+    for r in results:
+        if r['month_str'] not in by_month:
+            by_month[r['month_str']] = []
+        by_month[r['month_str']].append(f"{r['intern']} ({r['station']})")
+    
+    output_lines = [f"**Assignments for '{station_name}'**" + (f" in {month_year}" if month_year else "") + ":"]
+    for month, interns_list in sorted(by_month.items()):
+        output_lines.append(f"\n{month}:")
+        for intern_info in interns_list:
+            output_lines.append(f"  - {intern_info}")
+    
+    return "\n".join(output_lines)
+
+
+def get_ai_response(user_input, context, message_history=None, interns=None):
+    """Get AI response from Gemini API with function calling tools."""
     # Extract context information
     total_interns = context.get('total_interns', 0)
     critical_stations = context.get('critical_stations', [])
     bottleneck_count = context.get('bottleneck_count', 0)
+    intern_names = context.get('intern_names', [])
+    station_names = context.get('station_names', [])
     
-    # Keyword-based smart responses
-    if any(word in user_input_lower for word in ['help', 'what can you do', 'capabilities', 'how']):
-        return f"""I'm ResiPlan Copilot, your AI scheduling assistant! 🤖
+    # Build the system prompt with context
+    system_prompt = f"""You are ResiPlan Copilot, an AI scheduling assistant for an Obstetrics & Gynecology residency program.
 
-I can help you with:
-- **Analyzing bottlenecks** in your {total_interns}-intern schedule
-- **Suggesting solutions** for capacity issues
-- **Explaining constraints** and rotation requirements
-- **Optimizing assignments** to balance workload
+CURRENT CONTEXT:
+- Total interns in system: {total_interns}
+- Number of bottlenecks detected: {bottleneck_count}
+- Critical stations with issues: {', '.join(critical_stations) if critical_stations else 'None'}
+- Intern names in system: {', '.join(intern_names) if intern_names else 'None loaded'}
+- Available stations: {', '.join(station_names) if station_names else 'Standard stations'}
 
-Currently tracking: {bottleneck_count} potential bottlenecks
-Just ask me about any scheduling issue!"""
+SYSTEM KNOWLEDGE:
+- The system uses OR-Tools constraint solver to generate schedules
+- Interns follow either Model A (72 months) or Model B (66 months) training paths
+- Stage A exam: June only, 3-4.5 years from start
+- Stage B exam: Nov/March, final year only
+- Each station has min/max capacity limits
 
-    elif any(word in user_input_lower for word in ['bottleneck', 'problem', 'issue', 'warning']):
-        if critical_stations:
-            stations_text = ", ".join(critical_stations[:3])
-            return f"""🔴 **Critical Capacity Issues Detected**
+AVAILABLE TOOLS:
+You have access to tools to query the schedule database. Use them when asked about:
+- Specific intern schedules (use get_intern_schedule)
+- Who is assigned to a station (use get_station_assignments)
 
-Based on current analysis, I see bottlenecks in:
-- {stations_text}
+FEATURES YOU CAN HELP WITH:
+1. "Interactive Editor" tab - Direct schedule editing
+2. "God View" tab - Visual timeline of all residents
+3. "Analytics & Bottlenecks" tab - Capacity analysis
+4. "🚀 Run AI Scheduler" button - Automated optimization
+5. PDF audit export for compliance
 
-**Recommended Actions:**
-1. Run the AI Scheduler to automatically rebalance assignments
-2. Check the "Analytics & Bottlenecks" tab for detailed month-by-month breakdown
-3. Consider extending rotation durations or adjusting start dates
+INSTRUCTIONS:
+- Be helpful, concise, and specific to residency scheduling
+- USE THE TOOLS when the user asks about specific interns or station assignments
+- Reference the actual context data when relevant
+- Suggest actionable steps using the dashboard features
+- Use emojis sparingly for readability
+"""
 
-Would you like specific suggestions for any station?"""
-        else:
-            return f"✅ Good news! No critical bottlenecks detected in your schedule. Your {total_interns} interns are well-distributed across stations."
-
-    elif any(word in user_input_lower for word in ['july', 'june', 'month', 'when']):
-        months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 
-                  'September', 'October', 'November', 'December']
-        mentioned_month = next((m for m in months if m.lower() in user_input_lower), 'the mentioned month')
+    try:
+        # Configure the API
+        api_key = os.getenv('GOOGLE_API_KEY')
+        if not api_key:
+            return "⚠️ GOOGLE_API_KEY not found. Please set up your API key in the .env file."
         
-        return f"""📅 **{mentioned_month} Analysis**
-
-Common issues in {mentioned_month}:
-- Stage A exams (June only) - ensure Basic Sciences completed
-- Vacation conflicts - verify leave schedules
-- Capacity crunches - check staffing minimums
-
-**Quick Fix:**
-1. Go to "Interactive Editor" tab
-2. Review {mentioned_month} column
-3. Manually adjust assignments if needed
-4. Click "Apply Edits" to save
-
-Check the "God View" tab for visual timeline!"""
-
-    elif any(word in user_input_lower for word in ['intern', 'resident', 'who', 'assign']):
-        return f"""👥 **Intern Management**
-
-Currently managing {total_interns} residents in the system.
-
-**To view individual schedules:**
-- Go to "Interactive Editor" tab
-- Each column shows one intern's full schedule
-- Edit cells directly to reassign rotations
-
-**To optimize assignments:**
-- Click "🚀 Run AI Scheduler" in sidebar
-- The solver will automatically balance {total_interns} residents across all stations
-- Respects all constraints (duration, capacity, sequencing)"""
-
-    elif any(word in user_input_lower for word in ['capacity', 'staff', 'shortage', 'understaffed']):
-        if critical_stations:
-            return f"""⚠️ **Capacity Issues Identified**
-
-Understaffed stations: {", ".join(critical_stations)}
-
-**Solutions:**
-1. **Automated**: Run AI Scheduler to rebalance
-2. **Manual**: Go to Interactive Editor, move residents from overstaffed to understaffed stations
-3. **Relaxed Mode**: If solver fails, it will automatically try relaxed constraints
-
-The system enforces:
-- Min/Max capacity per station
-- Required rotation durations
-- Sequential dependencies"""
-        else:
-            return f"✅ All stations are adequately staffed! Your {total_interns} interns meet capacity requirements across all rotations."
-
-    elif any(word in user_input_lower for word in ['constraint', 'rule', 'requirement', 'must']):
-        return """📋 **Scheduling Constraints**
-
-The system enforces these hard rules:
-1. **Duration**: HRP (6mo), Birth (6mo), Gyn (6mo), IVF (6mo)
-2. **Capacity**: Each station has min/max intern limits
-3. **Sequencing**: Basic Sciences → Stage A → Stage B
-4. **Stage A Timing**: June only, 3-4.5 years from start
-5. **Stage B Timing**: Nov/March, final year only
-6. **Immutable Past**: Cannot change past/current months
-7. **Department**: Respect A/B assignments
-
-**Soft preferences:**
-- Consecutive months for same station (continuity)
-- Balance workload across residents"""
-
-    elif any(word in user_input_lower for word in ['optimize', 'improve', 'better', 'solution']):
-        return f"""💡 **Optimization Strategies**
-
-For your {total_interns}-intern program:
-
-**Immediate Actions:**
-1. Run "🚀 AI Scheduler" (uses OR-Tools constraint solver)
-2. Set time limit 300+ seconds for better solutions
-3. Check "Analytics & Bottlenecks" tab for red flags
-
-**Manual Tuning:**
-- Use "Interactive Editor" to fine-tune AI results
-- Focus on months with critical issues first
-- Verify Stage A/B timing compliance
-
-**Advanced:**
-- If solver fails, it automatically relaxes capacity constraints
-- Export PDF audit report for documentation
-- Review bottleneck forecast to prevent future issues"""
-
-    elif any(word in user_input_lower for word in ['error', 'fail', 'not working', 'problem']):
-        return """🔧 **Troubleshooting Guide**
-
-Common issues and fixes:
-
-**Solver fails:**
-- Increase time limit (try 600 seconds)
-- Check if constraints are achievable
-- System will auto-try relaxed mode
-
-**Excel won't load:**
-- Verify format: Names in row 1, column B+
-- Metadata in rows 82-84
-- File not corrupted
-
-**Edits not saving:**
-- Click "💾 Apply Edits" button
-- Station names must match exactly
-- Refresh page if UI freezes
-
-**Visual errors:**
-- Reload page
-- Check browser console (F12)
-- Try different browser"""
-
-    elif any(word in user_input_lower for word in ['thank', 'thanks', 'great', 'good']):
-        return "You're welcome! Happy to help optimize your residency program. Feel free to ask anything else! 😊"
-
-    else:
-        # Default intelligent response
-        return f"""I understand you're asking about: "{user_input}"
-
-**Quick Context:**
-- Managing {total_interns} residents
-- {bottleneck_count} potential bottlenecks detected
-{f"- Critical stations: {', '.join(critical_stations)}" if critical_stations else "- All stations adequately staffed"}
-
-**I can help with:**
-- Analyzing specific months or stations
-- Explaining constraints and rules
-- Suggesting optimization strategies
-- Troubleshooting scheduling issues
-
-Could you be more specific about what you'd like to know?"""
+        genai.configure(api_key=api_key)
+        
+        # Define the tools for function calling
+        tools = [
+            {
+                "function_declarations": [
+                    {
+                        "name": "get_intern_schedule",
+                        "description": "Get the full schedule for a specific intern including their model, department, start date, and all monthly assignments. Use this when the user asks about a specific intern's schedule.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "intern_name": {
+                                    "type": "string",
+                                    "description": "The name (or partial name) of the intern to look up"
+                                }
+                            },
+                            "required": ["intern_name"]
+                        }
+                    },
+                    {
+                        "name": "get_station_assignments",
+                        "description": "Get all interns assigned to a specific station, optionally filtered by month. Use this when the user asks who is working at a station or about station staffing.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "station_name": {
+                                    "type": "string",
+                                    "description": "The name of the station (e.g., 'Birth', 'HRP A', 'Gynecology B', 'IVF')"
+                                },
+                                "month_year": {
+                                    "type": "string",
+                                    "description": "Optional: specific month to filter by (e.g., 'July 2025', 'January 2026')"
+                                }
+                            },
+                            "required": ["station_name"]
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        # Create model with tools
+        model = genai.GenerativeModel('gemini-2.5-flash', tools=tools)
+        
+        # Build conversation history for the chat
+        chat_history = []
+        if message_history:
+            for msg in message_history:
+                role = "user" if msg["role"] == "user" else "model"
+                chat_history.append({"role": role, "parts": [msg["content"]]})
+        
+        # Start chat with history
+        chat = model.start_chat(history=chat_history)
+        
+        # Send the user message with system context
+        full_message = f"{system_prompt}\n\nUser question: {user_input}"
+        response = chat.send_message(full_message)
+        
+        # Check if the model wants to call a function
+        max_iterations = 5  # Prevent infinite loops
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Check for function calls in the response
+            function_call = None
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'function_call') and part.function_call:
+                    function_call = part.function_call
+                    break
+            
+            if not function_call:
+                # No function call, return the text response
+                break
+            
+            # Execute the function
+            func_name = function_call.name
+            func_args = dict(function_call.args)
+            
+            if func_name == "get_intern_schedule":
+                result = tool_get_intern_schedule(interns, func_args.get("intern_name", ""))
+            elif func_name == "get_station_assignments":
+                result = tool_get_station_assignments(
+                    interns, 
+                    func_args.get("station_name", ""),
+                    func_args.get("month_year")
+                )
+            else:
+                result = f"Unknown function: {func_name}"
+            
+            # Send the function result back to the model
+            response = chat.send_message(
+                genai.protos.Content(
+                    parts=[genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=func_name,
+                            response={"result": result}
+                        )
+                    )]
+                )
+            )
+        
+        # Extract final text response
+        final_response = ""
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, 'text') and part.text:
+                final_response += part.text
+        
+        return final_response if final_response else "I processed your request but couldn't generate a response."
+        
+    except Exception as e:
+        return f"⚠️ Error connecting to AI: {str(e)}\n\nPlease check your GOOGLE_API_KEY is valid."
 
 # ==================== MAIN DASHBOARD ====================
 
@@ -649,7 +738,9 @@ Try asking: *"What bottlenecks do I have?"* or *"How can I optimize my schedule?
         context = {
             'total_interns': len(st.session_state.interns),
             'bottleneck_count': 0,
-            'critical_stations': []
+            'critical_stations': [],
+            'intern_names': [i.name for i in st.session_state.interns] if st.session_state.interns else [],
+            'station_names': list(config.STATIONS_MODEL_A.keys())
         }
         
         # Get bottleneck info if available
@@ -670,8 +761,8 @@ Try asking: *"What bottlenecks do I have?"* or *"How can I optimize my schedule?
             except:
                 pass
         
-        # Get AI response
-        response = get_ai_response(prompt, context)
+        # Get AI response with conversation history and interns data
+        response = get_ai_response(prompt, context, st.session_state.messages, st.session_state.interns)
         
         # Add assistant response to history
         st.session_state.messages.append({"role": "assistant", "content": response})
