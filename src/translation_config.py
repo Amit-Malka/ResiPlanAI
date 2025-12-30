@@ -42,3 +42,4 @@ def get_hebrew_translation(text: str) -> str:
     """Get precomputed translation for common Hebrew terms."""
     return HEBREW_MEDICAL_TERMS.get(text, text)
 
+
