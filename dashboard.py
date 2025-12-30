@@ -443,6 +443,39 @@ def tool_get_station_assignments(interns, station_name, month_year=None):
     return "\n".join(output_lines)
 
 
+def tool_get_month_summary(interns, month_year):
+    """Tool: Get a summary of all intern assignments for a specific month across all stations."""
+    if not interns:
+        return "No interns loaded in the system."
+    
+    results = {}
+    
+    for intern in interns:
+        for month_idx, station in intern.assignments.items():
+            actual_date = intern.start_date + timedelta(days=month_idx * 30)
+            month_str = actual_date.strftime('%B %Y')
+            
+            # Check if this month matches the query
+            if month_year.lower() in month_str.lower():
+                if station not in results:
+                    results[station] = []
+                results[station].append(intern.name)
+    
+    if not results:
+        return f"No assignments found for {month_year}."
+    
+    output_lines = [f"**Schedule Summary for {month_year}:**\n"]
+    for station, intern_list in sorted(results.items()):
+        output_lines.append(f"**{station}** ({len(intern_list)} interns):")
+        for name in sorted(intern_list):
+            output_lines.append(f"  - {name}")
+        output_lines.append("")
+    
+    output_lines.append(f"\n*Total: {sum(len(v) for v in results.values())} assignments across {len(results)} stations*")
+    
+    return "\n".join(output_lines)
+
+
 def get_ai_response(user_input, context, message_history=None, interns=None):
     """Get AI response from Gemini API with function calling tools."""
     # Extract context information
@@ -473,6 +506,7 @@ AVAILABLE TOOLS:
 You have access to tools to query the schedule database. Use them when asked about:
 - Specific intern schedules (use get_intern_schedule)
 - Who is assigned to a station (use get_station_assignments)
+- Summary of who is assigned to where in a specific month (use get_month_summary)
 
 FEATURES YOU CAN HELP WITH:
 1. "Interactive Editor" tab - Direct schedule editing
@@ -532,6 +566,20 @@ INSTRUCTIONS:
                             },
                             "required": ["station_name"]
                         }
+                    },
+                    {
+                        "name": "get_month_summary",
+                        "description": "Get a complete summary of all intern assignments for a specific month, showing who is at each station. Use this when the user asks about a whole month's schedule, 'who is where in [month]', or wants an overview of assignments for a specific month.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "month_year": {
+                                    "type": "string",
+                                    "description": "The month and year to summarize (e.g., 'December 2025', 'January 2026')"
+                                }
+                            },
+                            "required": ["month_year"]
+                        }
                     }
                 ]
             }
@@ -584,6 +632,8 @@ INSTRUCTIONS:
                     func_args.get("station_name", ""),
                     func_args.get("month_year")
                 )
+            elif func_name == "get_month_summary":
+                result = tool_get_month_summary(interns, func_args.get("month_year", ""))
             else:
                 result = f"Unknown function: {func_name}"
             
